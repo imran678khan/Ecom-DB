@@ -1,6 +1,7 @@
 -- =============================================
--- SHOPIFY PRODUCT MANAGEMENT EXTENSION
+-- GENERIC PRODUCT MANAGEMENT EXTENSION
 -- For Existing Database: ODB1
+-- Supports: Shopify, WooCommerce, Magento, Custom Stores
 -- Extends: Multi-tenant architecture (OnSellerId, GroupId, CompanyId, BranchId)
 -- Date: 2026-05-04
 -- =============================================
@@ -9,28 +10,35 @@ USE [ODB1];
 GO
 
 -- =============================================
--- 1. SHOPIFY STORE CONFIGURATION (Multi-tenant)
+-- 1. STORE CONFIGURATION (Multi-tenant, Multi-platform)
 -- =============================================
 
-IF OBJECT_ID('dbo.ShopifyStoreConfigs', 'U') IS NOT NULL
-    DROP TABLE dbo.ShopifyStoreConfigs;
+IF OBJECT_ID('dbo.StoreConfigs', 'U') IS NOT NULL
+    DROP TABLE dbo.StoreConfigs;
 GO
 
-CREATE TABLE dbo.ShopifyStoreConfigs (
-    ShopifyStoreConfigId INT IDENTITY(1,1) PRIMARY KEY,
+CREATE TABLE dbo.StoreConfigs (
+    StoreConfigId INT IDENTITY(1,1) PRIMARY KEY,
     OnSellerId INT NOT NULL,
     GroupId INT NOT NULL,
     CompanyId INT NOT NULL,
     BranchId INT NULL,
     
-    -- Shopify Configuration
-    StoreName NVARCHAR(100) NOT NULL,
-    ShopDomain NVARCHAR(255) NOT NULL,
-    AccessToken NVARCHAR(500) NOT NULL,
-    ApiVersion NVARCHAR(20) DEFAULT '2024-04',
-    CurrencyCode NVARCHAR(3) DEFAULT 'USD',
+    -- Store Configuration
+    StoreCode NVARCHAR(50) NOT NULL,
+    StoreName NVARCHAR(200) NOT NULL,
+    PlatformType NVARCHAR(50) NOT NULL, -- 'shopify', 'woocommerce', 'magento', 'custom'
+    
+    -- Platform Specific Configuration
+    ApiUrl NVARCHAR(500) NULL,
+    ApiKey NVARCHAR(500) NULL,
+    ApiSecret NVARCHAR(500) NULL,
+    AccessToken NVARCHAR(500) NULL,
+    ApiVersion NVARCHAR(20) NULL,
     
     -- Store Settings
+    DefaultCurrency NVARCHAR(3) DEFAULT 'USD',
+    Timezone NVARCHAR(100) DEFAULT 'UTC',
     IsActive BIT NOT NULL DEFAULT 1,
     SyncEnabled BIT NOT NULL DEFAULT 1,
     AutoSyncInterval INT NULL, -- In minutes
@@ -39,59 +47,66 @@ CREATE TABLE dbo.ShopifyStoreConfigs (
     -- Webhook Settings
     WebhookSecret NVARCHAR(255) NULL,
     
-    -- Audit Fields (matching your existing pattern)
+    -- Configuration JSON (platform-specific settings)
+    Config JSON NULL,
+    
+    -- Audit Fields
     CreatedBy INT NOT NULL,
     CreatedDate DATETIME NOT NULL DEFAULT GETDATE(),
     ModifiedBy INT NULL,
     ModifiedDate DATETIME NULL,
     
-    CONSTRAINT UQ_ShopifyStoreConfigs_Domain UNIQUE (ShopDomain),
-    CONSTRAINT UQ_ShopifyStoreConfigs_Company_StoreName UNIQUE (CompanyId, StoreName),
-    CONSTRAINT FK_ShopifyStoreConfigs_Company FOREIGN KEY (CompanyId) REFERENCES dbo.Companies(CompanyId),
-    CONSTRAINT FK_ShopifyStoreConfigs_Branch FOREIGN KEY (BranchId) REFERENCES dbo.Companies(CompanyId) -- Note: Assuming Branches are in Companies table with Type
+    CONSTRAINT UQ_StoreConfigs_Company_Code UNIQUE (CompanyId, StoreCode),
+    CONSTRAINT FK_StoreConfigs_Company FOREIGN KEY (CompanyId) REFERENCES dbo.Companies(CompanyId)
 );
 GO
 
 -- =============================================
--- 2. SHOPIFY PRODUCT CATEGORIES (Collections)
+-- 2. PRODUCT CATEGORIES/COLLECTIONS
 -- =============================================
 
-IF OBJECT_ID('dbo.ShopifyCollections', 'U') IS NOT NULL
-    DROP TABLE dbo.ShopifyCollections;
+IF OBJECT_ID('dbo.ProductCategories', 'U') IS NOT NULL
+    DROP TABLE dbo.ProductCategories;
 GO
 
-CREATE TABLE dbo.ShopifyCollections (
-    ShopifyCollectionId INT IDENTITY(1,1) PRIMARY KEY,
-    ShopifyStoreConfigId INT NOT NULL,
+CREATE TABLE dbo.ProductCategories (
+    ProductCategoryId INT IDENTITY(1,1) PRIMARY KEY,
+    StoreConfigId INT NOT NULL,
     
-    -- Shopify Source IDs
-    ShopifyCollectionSourceId BIGINT NOT NULL,
+    -- Source IDs (for external platform sync)
+    SourceCategoryId NVARCHAR(255) NULL, -- Platform's original ID
+    SourcePlatform NVARCHAR(50) NULL, -- Which platform this came from
+    
     Handle NVARCHAR(255) NOT NULL,
-    Title NVARCHAR(500) NOT NULL,
-    BodyHtml NVARCHAR(MAX) NULL,
-    CollectionType NVARCHAR(50) DEFAULT 'custom', -- custom, smart
+    Name NVARCHAR(500) NOT NULL,
+    Description NVARCHAR(MAX) NULL,
+    CategoryType NVARCHAR(50) DEFAULT 'manual', -- manual, smart, automatic
     
-    -- Local Category Mapping (if needed)
+    -- Local Category Mapping
     DropDownDetailId INT NULL, -- Link to your existing category dropdown
     
     -- Sorting & Display
     SortOrder NVARCHAR(50) DEFAULT 'manual',
+    ParentCategoryId INT NULL,
+    CategoryLevel INT DEFAULT 0,
+    CategoryPath NVARCHAR(MAX) NULL, -- Materialized path for hierarchy
+    
     PublishedAt DATETIME NULL,
-    UpdatedAtShopify DATETIME NULL,
     
     -- SEO
-    SeoTitle NVARCHAR(255) NULL,
-    SeoDescription NVARCHAR(500) NULL,
+    MetaTitle NVARCHAR(255) NULL,
+    MetaDescription NVARCHAR(500) NULL,
+    MetaKeywords NVARCHAR(500) NULL,
     
-    -- Image
-    ImageSrc NVARCHAR(1000) NULL,
+    -- Images
+    ImageUrl NVARCHAR(1000) NULL,
     ImageAltText NVARCHAR(255) NULL,
     
-    -- Shopify Smart Collection Rules
+    -- Smart Category Rules (JSON)
     Rules JSON NULL,
     Disjunctive BIT DEFAULT 0,
     
-    -- Multi-tenant (inherited from StoreConfig)
+    -- Multi-tenant
     OnSellerId INT NOT NULL,
     GroupId INT NOT NULL,
     CompanyId INT NOT NULL,
@@ -100,6 +115,7 @@ CREATE TABLE dbo.ShopifyCollections (
     -- Status
     IsActive BIT NOT NULL DEFAULT 1,
     SyncStatus NVARCHAR(50) DEFAULT 'synced',
+    LastSyncedAt DATETIME NULL,
     
     -- Audit
     CreatedBy INT NOT NULL,
@@ -107,60 +123,72 @@ CREATE TABLE dbo.ShopifyCollections (
     ModifiedBy INT NULL,
     ModifiedDate DATETIME NULL,
     
-    CONSTRAINT UQ_ShopifyCollections_Store_ShopifyId UNIQUE (ShopifyStoreConfigId, ShopifyCollectionSourceId),
-    CONSTRAINT UQ_ShopifyCollections_Store_Handle UNIQUE (ShopifyStoreConfigId, Handle),
-    CONSTRAINT FK_ShopifyCollections_StoreConfig FOREIGN KEY (ShopifyStoreConfigId) REFERENCES dbo.ShopifyStoreConfigs(ShopifyStoreConfigId)
+    CONSTRAINT UQ_ProductCategories_Store_Handle UNIQUE (StoreConfigId, Handle),
+    CONSTRAINT UQ_ProductCategories_Store_Source UNIQUE (StoreConfigId, SourcePlatform, SourceCategoryId),
+    CONSTRAINT FK_ProductCategories_StoreConfig FOREIGN KEY (StoreConfigId) REFERENCES dbo.StoreConfigs(StoreConfigId),
+    CONSTRAINT FK_ProductCategories_Parent FOREIGN KEY (ParentCategoryId) REFERENCES dbo.ProductCategories(ProductCategoryId)
 );
 GO
 
 -- =============================================
--- 3. SHOPIFY PRODUCTS MASTER
+-- 3. PRODUCTS MASTER
 -- =============================================
 
-IF OBJECT_ID('dbo.ShopifyProducts', 'U') IS NOT NULL
-    DROP TABLE dbo.ShopifyProducts;
+IF OBJECT_ID('dbo.Products', 'U') IS NOT NULL
+    DROP TABLE dbo.Products;
 GO
 
-CREATE TABLE dbo.ShopifyProducts (
-    ShopifyProductId INT IDENTITY(1,1) PRIMARY KEY,
-    ShopifyStoreConfigId INT NOT NULL,
+CREATE TABLE dbo.Products (
+    ProductId INT IDENTITY(1,1) PRIMARY KEY,
+    StoreConfigId INT NOT NULL,
     
-    -- Shopify Source IDs
-    ShopifyProductSourceId BIGINT NOT NULL,
-    Title NVARCHAR(500) NOT NULL,
+    -- Source IDs (for external platform sync)
+    SourceProductId NVARCHAR(255) NULL, -- Platform's original product ID
+    SourcePlatform NVARCHAR(50) NULL, -- Which platform this came from
+    
+    -- Basic Info
+    Sku NVARCHAR(255) NOT NULL,
+    Gtin NVARCHAR(50) NULL, -- GTIN/UPC/EAN/ISBN
+    Name NVARCHAR(500) NOT NULL,
     Handle NVARCHAR(255) NOT NULL,
-    BodyHtml NVARCHAR(MAX) NULL,
+    ShortDescription NVARCHAR(1000) NULL,
+    Description NVARCHAR(MAX) NULL,
     
-    -- Product Type & Vendor (Links to your existing masters)
+    -- Product Type (links to DropdownDetails)
+    ProductTypeId INT NULL, -- DropdownDetailId for product type
     Vendor NVARCHAR(255) NULL,
-    ProductType NVARCHAR(255) NULL,
-    DropDownDetailId INT NULL, -- Link to product type dropdown
+    BrandId INT NULL, -- If you have brands table
     
     -- URLs
-    ShopifyUrl NVARCHAR(500) NULL,
+    ProductUrl NVARCHAR(500) NULL,
     
     -- Status (matching your existing pattern)
-    Status INT NOT NULL DEFAULT 1, -- 1: Draft, 2: Active, 3: Archived
-    PublishedScope NVARCHAR(50) DEFAULT 'global',
+    Status INT NOT NULL DEFAULT 1, -- 1: Draft, 2: Active, 3: Archived, 4: Discontinued
+    Visibility NVARCHAR(50) DEFAULT 'catalog_search', -- catalog, search, catalog_search, hidden
+    IsFeatured BIT NOT NULL DEFAULT 0,
+    
+    -- Publishing
     PublishedAt DATETIME NULL,
+    AvailableFrom DATETIME NULL,
+    AvailableTo DATETIME NULL,
     
     -- Template
-    TemplateSuffix NVARCHAR(100) NULL,
+    TemplateName NVARCHAR(100) NULL,
     
-    -- SEO (matching your existing Meta structure)
+    -- SEO
     MetaTitle NVARCHAR(255) NULL,
     MetaDescription NVARCHAR(500) NULL,
     MetaKeywords NVARCHAR(500) NULL,
     
-    -- Shopify Tags (stored as JSON)
-    Tags JSON NULL,
-    
-    -- Options (up to 3)
+    -- Product Options (for configurable products)
+    HasVariants BIT NOT NULL DEFAULT 0,
+    VariantsCount INT NOT NULL DEFAULT 0,
     Option1Name NVARCHAR(100) NULL,
     Option2Name NVARCHAR(100) NULL,
     Option3Name NVARCHAR(100) NULL,
-    HasVariants BIT NOT NULL DEFAULT 0,
-    VariantsCount INT NOT NULL DEFAULT 0,
+    
+    -- Tags (JSON array for flexible tagging)
+    Tags JSON NULL,
     
     -- Multi-tenant (matching your existing pattern)
     OnSellerId INT NOT NULL,
@@ -172,65 +200,73 @@ CREATE TABLE dbo.ShopifyProducts (
     -- Sync tracking
     SyncStatus NVARCHAR(50) DEFAULT 'synced',
     LastSyncedAt DATETIME NULL,
-    CreatedAtShopify DATETIME NULL,
-    UpdatedAtShopify DATETIME NULL,
+    CreatedAtSource DATETIME NULL,
+    UpdatedAtSource DATETIME NULL,
     
-    -- Custom attributes (JSON for flexible data - similar to your pattern)
-    Attributes JSON NULL,
-    ExternalData JSON NULL,
+    -- Custom data
+    Attributes JSON NULL, -- Flexible product attributes
+    ExternalData JSON NULL, -- Raw source data storage
+    Metadata JSON NULL, -- Additional metadata
     
-    -- Audit fields (matching your existing tables)
+    -- Audit fields
     CreatedBy INT NOT NULL,
     CreatedDate DATETIME NOT NULL DEFAULT GETDATE(),
     ModifiedBy INT NULL,
     ModifiedDate DATETIME NULL,
     
-    CONSTRAINT UQ_ShopifyProducts_Store_ShopifyId UNIQUE (ShopifyStoreConfigId, ShopifyProductSourceId),
-    CONSTRAINT UQ_ShopifyProducts_Store_Handle UNIQUE (ShopifyStoreConfigId, Handle),
-    CONSTRAINT FK_ShopifyProducts_StoreConfig FOREIGN KEY (ShopifyStoreConfigId) REFERENCES dbo.ShopifyStoreConfigs(ShopifyStoreConfigId)
+    CONSTRAINT UQ_Products_Company_Sku UNIQUE (CompanyId, Sku),
+    CONSTRAINT UQ_Products_Store_Handle UNIQUE (StoreConfigId, Handle),
+    CONSTRAINT UQ_Products_Store_Source UNIQUE (StoreConfigId, SourcePlatform, SourceProductId),
+    CONSTRAINT FK_Products_StoreConfig FOREIGN KEY (StoreConfigId) REFERENCES dbo.StoreConfigs(StoreConfigId),
+    CONSTRAINT FK_Products_Brand FOREIGN KEY (BrandId) REFERENCES dbo.DropdownDetails(DropDownDetailId)
 );
 GO
 
 -- =============================================
--- 4. SHOPIFY PRODUCT-COLLECTION MAPPING
+-- 4. PRODUCT-CATEGORY MAPPING
 -- =============================================
 
-IF OBJECT_ID('dbo.ShopifyProductCollections', 'U') IS NOT NULL
-    DROP TABLE dbo.ShopifyProductCollections;
+IF OBJECT_ID('dbo.ProductCategoryMappings', 'U') IS NOT NULL
+    DROP TABLE dbo.ProductCategoryMappings;
 GO
 
-CREATE TABLE dbo.ShopifyProductCollections (
-    ShopifyProductCollectionId INT IDENTITY(1,1) PRIMARY KEY,
-    ShopifyProductId INT NOT NULL,
-    ShopifyCollectionId INT NOT NULL,
+CREATE TABLE dbo.ProductCategoryMappings (
+    ProductCategoryMappingId INT IDENTITY(1,1) PRIMARY KEY,
+    ProductId INT NOT NULL,
+    ProductCategoryId INT NOT NULL,
+    IsPrimary BIT NOT NULL DEFAULT 0,
     Position INT DEFAULT 0,
     CreatedDate DATETIME NOT NULL DEFAULT GETDATE(),
     
-    CONSTRAINT UQ_ShopifyProductCollections_Product_Collection UNIQUE (ShopifyProductId, ShopifyCollectionId),
-    CONSTRAINT FK_ShopifyProductCollections_Product FOREIGN KEY (ShopifyProductId) REFERENCES dbo.ShopifyProducts(ShopifyProductId) ON DELETE CASCADE,
-    CONSTRAINT FK_ShopifyProductCollections_Collection FOREIGN KEY (ShopifyCollectionId) REFERENCES dbo.ShopifyCollections(ShopifyCollectionId) ON DELETE CASCADE
+    CONSTRAINT UQ_ProductCategoryMappings_Product_Category UNIQUE (ProductId, ProductCategoryId),
+    CONSTRAINT FK_ProductCategoryMappings_Product FOREIGN KEY (ProductId) REFERENCES dbo.Products(ProductId) ON DELETE CASCADE,
+    CONSTRAINT FK_ProductCategoryMappings_Category FOREIGN KEY (ProductCategoryId) REFERENCES dbo.ProductCategories(ProductCategoryId) ON DELETE CASCADE
 );
 GO
 
 -- =============================================
--- 5. SHOPIFY VARIANTS
+-- 5. PRODUCT VARIANTS
 -- =============================================
 
-IF OBJECT_ID('dbo.ShopifyVariants', 'U') IS NOT NULL
-    DROP TABLE dbo.ShopifyVariants;
+IF OBJECT_ID('dbo.ProductVariants', 'U') IS NOT NULL
+    DROP TABLE dbo.ProductVariants;
 GO
 
-CREATE TABLE dbo.ShopifyVariants (
-    ShopifyVariantId INT IDENTITY(1,1) PRIMARY KEY,
-    ShopifyProductId INT NOT NULL,
+CREATE TABLE dbo.ProductVariants (
+    ProductVariantId INT IDENTITY(1,1) PRIMARY KEY,
+    ProductId INT NOT NULL,
     
-    -- Shopify Source IDs
-    ShopifyVariantSourceId BIGINT NOT NULL,
+    -- Source IDs
+    SourceVariantId NVARCHAR(255) NULL,
+    SourcePlatform NVARCHAR(50) NULL,
+    
+    -- Basic Info
     Title NVARCHAR(500) NOT NULL,
     Sku NVARCHAR(255) NULL,
     Barcode NVARCHAR(255) NULL,
+    Gtin NVARCHAR(50) NULL,
     
-    -- Option Values
+    -- Option Values (matching product options)
     Option1Value NVARCHAR(255) NULL,
     Option2Value NVARCHAR(255) NULL,
     Option3Value NVARCHAR(255) NULL,
@@ -238,19 +274,30 @@ CREATE TABLE dbo.ShopifyVariants (
     -- Pricing
     Price DECIMAL(18,2) NOT NULL DEFAULT 0,
     CompareAtPrice DECIMAL(18,2) NULL,
-    Cost DECIMAL(18,2) NULL,
+    CostPrice DECIMAL(18,2) NULL,
     Taxable BIT NOT NULL DEFAULT 1,
+    TaxClassId INT NULL, -- Link to your tax configuration
     
     -- Inventory (Base - detailed inventory in separate table)
-    InventoryQuantity INT NOT NULL DEFAULT 0,
-    InventoryPolicy NVARCHAR(20) DEFAULT 'deny',
-    InventoryManagement NVARCHAR(50) NULL,
-    InventoryItemId BIGINT NULL,
+    StockQuantity INT NOT NULL DEFAULT 0,
+    BackorderAllowed BIT NOT NULL DEFAULT 0,
+    MaxBackorderQuantity INT NULL,
+    LowStockThreshold INT NULL,
+    
+    -- Inventory Management
+    InventoryPolicy NVARCHAR(20) DEFAULT 'deny', -- deny, continue
+    InventoryManagement NVARCHAR(50) NULL, -- platform, external, manual
+    InventoryItemId NVARCHAR(255) NULL, -- Platform's inventory item ID
     
     -- Shipping
     Weight DECIMAL(18,4) NULL,
     WeightUnit NVARCHAR(10) DEFAULT 'kg',
+    Length DECIMAL(18,4) NULL,
+    Width DECIMAL(18,4) NULL,
+    Height DECIMAL(18,4) NULL,
+    DimensionUnit NVARCHAR(10) DEFAULT 'cm',
     RequiresShipping BIT NOT NULL DEFAULT 1,
+    FreeShipping BIT NOT NULL DEFAULT 0,
     
     -- Position & Default
     Position INT NOT NULL DEFAULT 0,
@@ -260,12 +307,17 @@ CREATE TABLE dbo.ShopifyVariants (
     FulfillmentService NVARCHAR(100) DEFAULT 'manual',
     
     -- Status
-    Status INT NOT NULL DEFAULT 1, -- 1: Active, 2: Archived
+    Status INT NOT NULL DEFAULT 1, -- 1: Active, 2: Archived, 3: Discontinued
     
     -- Sync tracking
     SyncStatus NVARCHAR(50) DEFAULT 'synced',
-    CreatedAtShopify DATETIME NULL,
-    UpdatedAtShopify DATETIME NULL,
+    LastSyncedAt DATETIME NULL,
+    CreatedAtSource DATETIME NULL,
+    UpdatedAtSource DATETIME NULL,
+    
+    -- Custom attributes JSON
+    Attributes JSON NULL,
+    ExternalData JSON NULL,
     
     -- Audit
     CreatedBy INT NOT NULL,
@@ -273,39 +325,46 @@ CREATE TABLE dbo.ShopifyVariants (
     ModifiedBy INT NULL,
     ModifiedDate DATETIME NULL,
     
-    CONSTRAINT UQ_ShopifyVariants_Product_ShopifyId UNIQUE (ShopifyProductId, ShopifyVariantSourceId),
-    CONSTRAINT UQ_ShopifyVariants_Product_Sku UNIQUE (ShopifyProductId, Sku),
-    CONSTRAINT FK_ShopifyVariants_Product FOREIGN KEY (ShopifyProductId) REFERENCES dbo.ShopifyProducts(ShopifyProductId) ON DELETE CASCADE
+    CONSTRAINT UQ_ProductVariants_Product_Sku UNIQUE (ProductId, Sku),
+    CONSTRAINT UQ_ProductVariants_Product_Source UNIQUE (ProductId, SourcePlatform, SourceVariantId),
+    CONSTRAINT FK_ProductVariants_Product FOREIGN KEY (ProductId) REFERENCES dbo.Products(ProductId) ON DELETE CASCADE
 );
 GO
 
 -- =============================================
--- 6. SHOPIFY INVENTORY (Multi-location - Extends your InventoryItems)
+-- 6. INVENTORY (Multi-location - Extends/Integrates with your InventoryItems)
 -- =============================================
 
-IF OBJECT_ID('dbo.ShopifyLocations', 'U') IS NOT NULL
-    DROP TABLE dbo.ShopifyLocations;
+IF OBJECT_ID('dbo.InventoryLocations', 'U') IS NOT NULL
+    DROP TABLE dbo.InventoryLocations;
 GO
 
-CREATE TABLE dbo.ShopifyLocations (
-    ShopifyLocationId INT IDENTITY(1,1) PRIMARY KEY,
-    ShopifyStoreConfigId INT NOT NULL,
+CREATE TABLE dbo.InventoryLocations (
+    InventoryLocationId INT IDENTITY(1,1) PRIMARY KEY,
+    StoreConfigId INT NOT NULL,
     
-    -- Shopify Source
-    ShopifyLocationSourceId BIGINT NOT NULL,
+    -- Source IDs
+    SourceLocationId NVARCHAR(255) NULL,
+    SourcePlatform NVARCHAR(50) NULL,
+    
+    -- Location Info
+    LocationCode NVARCHAR(50) NOT NULL,
     Name NVARCHAR(255) NOT NULL,
     
     -- Address (JSON for flexibility)
     Address JSON NULL,
     
-    -- Link to your existing location (if applicable)
+    -- Link to your existing location
     LocationId INT NULL,
     
+    -- Settings
     IsActive BIT NOT NULL DEFAULT 1,
+    IsDefault BIT NOT NULL DEFAULT 0,
     IsPrimary BIT NOT NULL DEFAULT 0,
     
-    CreatedAtShopify DATETIME NULL,
-    UpdatedAtShopify DATETIME NULL,
+    -- Sync tracking
+    CreatedAtSource DATETIME NULL,
+    UpdatedAtSource DATETIME NULL,
     
     -- Audit
     CreatedBy INT NOT NULL,
@@ -313,153 +372,131 @@ CREATE TABLE dbo.ShopifyLocations (
     ModifiedBy INT NULL,
     ModifiedDate DATETIME NULL,
     
-    CONSTRAINT FK_ShopifyLocations_StoreConfig FOREIGN KEY (ShopifyStoreConfigId) REFERENCES dbo.ShopifyStoreConfigs(ShopifyStoreConfigId),
-    CONSTRAINT FK_ShopifyLocations_Location FOREIGN KEY (LocationId) REFERENCES dbo.Locations(LocationId)
+    CONSTRAINT UQ_InventoryLocations_Store_Code UNIQUE (StoreConfigId, LocationCode),
+    CONSTRAINT FK_InventoryLocations_StoreConfig FOREIGN KEY (StoreConfigId) REFERENCES dbo.StoreConfigs(StoreConfigId),
+    CONSTRAINT FK_InventoryLocations_Location FOREIGN KEY (LocationId) REFERENCES dbo.Locations(LocationId)
 );
 GO
 
-IF OBJECT_ID('dbo.ShopifyInventoryLevels', 'U') IS NOT NULL
-    DROP TABLE dbo.ShopifyInventoryLevels;
+IF OBJECT_ID('dbo.InventoryLevels', 'U') IS NOT NULL
+    DROP TABLE dbo.InventoryLevels;
 GO
 
-CREATE TABLE dbo.ShopifyInventoryLevels (
-    ShopifyInventoryLevelId INT IDENTITY(1,1) PRIMARY KEY,
-    ShopifyVariantId INT NOT NULL,
-    ShopifyLocationId INT NOT NULL,
+CREATE TABLE dbo.InventoryLevels (
+    InventoryLevelId INT IDENTITY(1,1) PRIMARY KEY,
+    ProductVariantId INT NOT NULL,
+    InventoryLocationId INT NOT NULL,
     
     -- Inventory quantities
     AvailableQuantity INT NOT NULL DEFAULT 0,
     OnHandQuantity INT NOT NULL DEFAULT 0,
-    ReservedQuantity INT NOT NULL DEFAULT 0,
-    CommittedQuantity INT NOT NULL DEFAULT 0, -- For pending orders
+    ReservedQuantity INT NOT NULL DEFAULT 0, -- For pending orders
+    CommittedQuantity INT NOT NULL DEFAULT 0, -- For allocated orders
+    IncomingQuantity INT NOT NULL DEFAULT 0, -- Expected from purchase orders
+    
+    -- Thresholds
+    MinStockThreshold INT NULL, -- Reorder point
+    MaxStockThreshold INT NULL,
+    ReorderQuantity INT NULL,
+    
+    -- Tracking
+    LastStockTakeDate DATETIME NULL,
+    ExpectedDeliveryDate DATE NULL,
     
     -- Sync tracking
-    UpdatedAtShopify DATETIME NULL,
+    UpdatedAtSource DATETIME NULL,
     LastSyncedAt DATETIME NOT NULL DEFAULT GETDATE(),
     
-    CONSTRAINT UQ_ShopifyInventoryLevels_Variant_Location UNIQUE (ShopifyVariantId, ShopifyLocationId),
-    CONSTRAINT FK_ShopifyInventoryLevels_Variant FOREIGN KEY (ShopifyVariantId) REFERENCES dbo.ShopifyVariants(ShopifyVariantId) ON DELETE CASCADE,
-    CONSTRAINT FK_ShopifyInventoryLevels_Location FOREIGN KEY (ShopifyLocationId) REFERENCES dbo.ShopifyLocations(ShopifyLocationId)
+    CONSTRAINT UQ_InventoryLevels_Variant_Location UNIQUE (ProductVariantId, InventoryLocationId),
+    CONSTRAINT FK_InventoryLevels_Variant FOREIGN KEY (ProductVariantId) REFERENCES dbo.ProductVariants(ProductVariantId) ON DELETE CASCADE,
+    CONSTRAINT FK_InventoryLevels_Location FOREIGN KEY (InventoryLocationId) REFERENCES dbo.InventoryLocations(InventoryLocationId)
 );
 GO
 
 -- =============================================
--- 7. SHOPIFY IMAGES
+-- 7. PRODUCT IMAGES
 -- =============================================
 
-IF OBJECT_ID('dbo.ShopifyImages', 'U') IS NOT NULL
-    DROP TABLE dbo.ShopifyImages;
+IF OBJECT_ID('dbo.ProductImages', 'U') IS NOT NULL
+    DROP TABLE dbo.ProductImages;
 GO
 
-CREATE TABLE dbo.ShopifyImages (
-    ShopifyImageId INT IDENTITY(1,1) PRIMARY KEY,
-    ShopifyProductId INT NOT NULL,
-    ShopifyVariantId INT NULL,
+CREATE TABLE dbo.ProductImages (
+    ProductImageId INT IDENTITY(1,1) PRIMARY KEY,
+    ProductId INT NOT NULL,
+    ProductVariantId INT NULL,
     
-    -- Shopify Source
-    ShopifyImageSourceId BIGINT NOT NULL,
-    Src NVARCHAR(1000) NOT NULL,
+    -- Source IDs
+    SourceImageId NVARCHAR(255) NULL,
+    SourcePlatform NVARCHAR(50) NULL,
+    
+    -- Image data
+    ImageUrl NVARCHAR(1000) NOT NULL,
+    ThumbnailUrl NVARCHAR(1000) NULL,
     AltText NVARCHAR(255) NULL,
+    Title NVARCHAR(255) NULL,
     Width INT NULL,
     Height INT NULL,
+    FileSize INT NULL, -- Size in bytes
     
     -- Link to your MediaLibrary
     MediaId INT NULL,
     
     -- Position
     Position INT NOT NULL DEFAULT 0,
+    IsPrimary BIT NOT NULL DEFAULT 0,
     
     -- Variant IDs associated (JSON array)
-    VariantIds JSON NULL,
+    AssociatedVariantIds JSON NULL,
     
-    -- Sync
-    CreatedAtShopify DATETIME NULL,
-    UpdatedAtShopify DATETIME NULL,
-    CreatedDate DATETIME NOT NULL DEFAULT GETDATE(),
+    -- Metadata
+    Metadata JSON NULL,
     
-    CONSTRAINT FK_ShopifyImages_Product FOREIGN KEY (ShopifyProductId) REFERENCES dbo.ShopifyProducts(ShopifyProductId) ON DELETE CASCADE,
-    CONSTRAINT FK_ShopifyImages_Variant FOREIGN KEY (ShopifyVariantId) REFERENCES dbo.ShopifyVariants(ShopifyVariantId),
-    CONSTRAINT FK_ShopifyImages_Media FOREIGN KEY (MediaId) REFERENCES dbo.MediaLibraries(MediaId)
-);
-GO
-
--- =============================================
--- 8. SHOPIFY METAFIELDS (Custom fields)
--- =============================================
-
-IF OBJECT_ID('dbo.ShopifyMetafields', 'U') IS NOT NULL
-    DROP TABLE dbo.ShopifyMetafields;
-GO
-
-CREATE TABLE dbo.ShopifyMetafields (
-    ShopifyMetafieldId INT IDENTITY(1,1) PRIMARY KEY,
-    ShopifyStoreConfigId INT NOT NULL,
-    
-    -- Owner Info
-    OwnerResource NVARCHAR(50) NOT NULL, -- product, variant, collection
-    OwnerId INT NOT NULL, -- ID in respective table
-    
-    -- Shopify Source
-    ShopifyMetafieldSourceId BIGINT NOT NULL,
-    Namespace NVARCHAR(255) NOT NULL,
-    KeyName NVARCHAR(255) NOT NULL, -- 'Key' is reserved, using KeyName
-    Value NVARCHAR(MAX) NOT NULL,
-    ValueType NVARCHAR(50) DEFAULT 'string',
-    Description NVARCHAR(500) NULL,
-    
-    -- Sync
-    CreatedAtShopify DATETIME NULL,
-    UpdatedAtShopify DATETIME NULL,
+    -- Sync tracking
+    CreatedAtSource DATETIME NULL,
+    UpdatedAtSource DATETIME NULL,
     
     -- Audit
     CreatedDate DATETIME NOT NULL DEFAULT GETDATE(),
     ModifiedDate DATETIME NULL,
     
-    CONSTRAINT UQ_ShopifyMetafields_Store_Owner_ShopifyId UNIQUE (ShopifyStoreConfigId, OwnerResource, OwnerId, ShopifyMetafieldSourceId),
-    CONSTRAINT UQ_ShopifyMetafields_Store_Owner_Namespace_Key UNIQUE (ShopifyStoreConfigId, OwnerResource, OwnerId, Namespace, KeyName),
-    CONSTRAINT FK_ShopifyMetafields_StoreConfig FOREIGN KEY (ShopifyStoreConfigId) REFERENCES dbo.ShopifyStoreConfigs(ShopifyStoreConfigId)
+    CONSTRAINT FK_ProductImages_Product FOREIGN KEY (ProductId) REFERENCES dbo.Products(ProductId) ON DELETE CASCADE,
+    CONSTRAINT FK_ProductImages_Variant FOREIGN KEY (ProductVariantId) REFERENCES dbo.ProductVariants(ProductVariantId),
+    CONSTRAINT FK_ProductImages_Media FOREIGN KEY (MediaId) REFERENCES dbo.MediaLibraries(MediaId)
 );
 GO
 
 -- =============================================
--- 9. SHOPIFY PRICE RULES (Discounts)
+-- 8. PRODUCT ATTRIBUTES (For variant attributes and custom fields)
 -- =============================================
 
-IF OBJECT_ID('dbo.ShopifyPriceRules', 'U') IS NOT NULL
-    DROP TABLE dbo.ShopifyPriceRules;
+IF OBJECT_ID('dbo.ProductAttributes', 'U') IS NOT NULL
+    DROP TABLE dbo.ProductAttributes;
 GO
 
-CREATE TABLE dbo.ShopifyPriceRules (
-    ShopifyPriceRuleId INT IDENTITY(1,1) PRIMARY KEY,
-    ShopifyStoreConfigId INT NOT NULL,
+CREATE TABLE dbo.ProductAttributes (
+    ProductAttributeId INT IDENTITY(1,1) PRIMARY KEY,
+    StoreConfigId INT NOT NULL,
     
-    -- Shopify Source
-    ShopifyPriceRuleSourceId BIGINT NOT NULL,
-    Title NVARCHAR(255) NOT NULL,
-    TargetType NVARCHAR(50) DEFAULT 'line_item',
-    TargetSelection NVARCHAR(50) DEFAULT 'all',
-    AllocationMethod NVARCHAR(50) DEFAULT 'each',
-    ValueType NVARCHAR(50) NOT NULL, -- fixed_amount, percentage
-    Value DECIMAL(18,4) NOT NULL,
+    -- Attribute Info
+    AttributeCode NVARCHAR(100) NOT NULL,
+    AttributeName NVARCHAR(200) NOT NULL,
+    AttributeType NVARCHAR(50) NOT NULL, -- text, select, multiselect, color, image, date, number, boolean
+    InputType NVARCHAR(50) NOT NULL, -- select, multiselect, radio, checkbox, swatch, text, textarea
     
-    -- Customer eligibility
-    CustomerSelection NVARCHAR(50) DEFAULT 'all',
-    CustomerIds JSON NULL,
+    -- Settings
+    IsRequired BIT NOT NULL DEFAULT 0,
+    IsVariantAttribute BIT NOT NULL DEFAULT 0, -- Used for product variations
+    IsFilterable BIT NOT NULL DEFAULT 1,
+    IsSearchable BIT NOT NULL DEFAULT 1,
+    IsComparable BIT NOT NULL DEFAULT 0,
+    DisplayOrder INT NOT NULL DEFAULT 0,
     
-    -- Time constraints
-    StartsAt DATETIME NULL,
-    EndsAt DATETIME NULL,
+    -- Default values
+    DefaultValue NVARCHAR(255) NULL,
     
-    -- Usage limits
-    UsageLimit INT NULL,
-    UsedCount INT NOT NULL DEFAULT 0,
-    
-    -- Prerequisite conditions
-    PrerequisiteConditions JSON NULL,
-    Entitlement JSON NULL,
-    
-    -- Status
-    Status INT NOT NULL DEFAULT 1, -- 1: Active, 2: Inactive
+    -- Validation
+    ValidationRules JSON NULL, -- min, max, pattern, etc.
     
     -- Multi-tenant
     OnSellerId INT NOT NULL,
@@ -467,9 +504,8 @@ CREATE TABLE dbo.ShopifyPriceRules (
     CompanyId INT NOT NULL,
     BranchId INT NULL,
     
-    -- Sync
-    CreatedAtShopify DATETIME NULL,
-    UpdatedAtShopify DATETIME NULL,
+    -- Status
+    IsActive BIT NOT NULL DEFAULT 1,
     
     -- Audit
     CreatedBy INT NOT NULL,
@@ -477,147 +513,338 @@ CREATE TABLE dbo.ShopifyPriceRules (
     ModifiedBy INT NULL,
     ModifiedDate DATETIME NULL,
     
-    CONSTRAINT FK_ShopifyPriceRules_StoreConfig FOREIGN KEY (ShopifyStoreConfigId) REFERENCES dbo.ShopifyStoreConfigs(ShopifyStoreConfigId)
+    CONSTRAINT UQ_ProductAttributes_Store_Code UNIQUE (StoreConfigId, AttributeCode),
+    CONSTRAINT FK_ProductAttributes_StoreConfig FOREIGN KEY (StoreConfigId) REFERENCES dbo.StoreConfigs(StoreConfigId)
 );
 GO
 
-IF OBJECT_ID('dbo.ShopifyDiscountCodes', 'U') IS NOT NULL
-    DROP TABLE dbo.ShopifyDiscountCodes;
+IF OBJECT_ID('dbo.ProductAttributeOptions', 'U') IS NOT NULL
+    DROP TABLE dbo.ProductAttributeOptions;
 GO
 
-CREATE TABLE dbo.ShopifyDiscountCodes (
-    ShopifyDiscountCodeId INT IDENTITY(1,1) PRIMARY KEY,
-    ShopifyPriceRuleId INT NOT NULL,
+CREATE TABLE dbo.ProductAttributeOptions (
+    ProductAttributeOptionId INT IDENTITY(1,1) PRIMARY KEY,
+    ProductAttributeId INT NOT NULL,
     
-    -- Shopify Source
-    ShopifyDiscountCodeSourceId BIGINT NOT NULL,
+    OptionValue NVARCHAR(255) NOT NULL,
+    OptionSlug NVARCHAR(255) NOT NULL,
+    SortOrder INT NOT NULL DEFAULT 0,
+    IsDefault BIT NOT NULL DEFAULT 0,
+    
+    -- Visual representation
+    SwatchValue NVARCHAR(100) NULL, -- Hex color code or image URL
+    OptionImageUrl NVARCHAR(1000) NULL,
+    
+    -- External source IDs
+    SourceOptionId NVARCHAR(255) NULL,
+    SourcePlatform NVARCHAR(50) NULL,
+    
+    CONSTRAINT UQ_ProductAttributeOptions_Attribute_Value UNIQUE (ProductAttributeId, OptionValue),
+    CONSTRAINT FK_ProductAttributeOptions_Attribute FOREIGN KEY (ProductAttributeId) REFERENCES dbo.ProductAttributes(ProductAttributeId) ON DELETE CASCADE
+);
+GO
+
+IF OBJECT_ID('dbo.ProductVariantAttributes', 'U') IS NOT NULL
+    DROP TABLE dbo.ProductVariantAttributes;
+GO
+
+CREATE TABLE dbo.ProductVariantAttributes (
+    ProductVariantId INT NOT NULL,
+    ProductAttributeId INT NOT NULL,
+    ProductAttributeOptionId INT NOT NULL,
+    
+    CONSTRAINT PK_ProductVariantAttributes PRIMARY KEY (ProductVariantId, ProductAttributeId),
+    CONSTRAINT FK_ProductVariantAttributes_Variant FOREIGN KEY (ProductVariantId) REFERENCES dbo.ProductVariants(ProductVariantId) ON DELETE CASCADE,
+    CONSTRAINT FK_ProductVariantAttributes_Attribute FOREIGN KEY (ProductAttributeId) REFERENCES dbo.ProductAttributes(ProductAttributeId),
+    CONSTRAINT FK_ProductVariantAttributes_Option FOREIGN KEY (ProductAttributeOptionId) REFERENCES dbo.ProductAttributeOptions(ProductAttributeOptionId)
+);
+GO
+
+-- =============================================
+-- 9. PRODUCT ATTRIBUTE VALUES (For simple products without variants)
+-- =============================================
+
+IF OBJECT_ID('dbo.ProductAttributeValues', 'U') IS NOT NULL
+    DROP TABLE dbo.ProductAttributeValues;
+GO
+
+CREATE TABLE dbo.ProductAttributeValues (
+    ProductId INT NOT NULL,
+    ProductAttributeId INT NOT NULL,
+    ProductAttributeOptionId INT NULL, -- For select/multiselect
+    ValueText NVARCHAR(MAX) NULL,
+    ValueDecimal DECIMAL(18,4) NULL,
+    ValueDate DATETIME NULL,
+    ValueBoolean BIT NULL,
+    ValueJson JSON NULL,
+    
+    CONSTRAINT PK_ProductAttributeValues PRIMARY KEY (ProductId, ProductAttributeId),
+    CONSTRAINT FK_ProductAttributeValues_Product FOREIGN KEY (ProductId) REFERENCES dbo.Products(ProductId) ON DELETE CASCADE,
+    CONSTRAINT FK_ProductAttributeValues_Attribute FOREIGN KEY (ProductAttributeId) REFERENCES dbo.ProductAttributes(ProductAttributeId),
+    CONSTRAINT FK_ProductAttributeValues_Option FOREIGN KEY (ProductAttributeOptionId) REFERENCES dbo.ProductAttributeOptions(ProductAttributeOptionId)
+);
+GO
+
+-- =============================================
+-- 10. PRICE RULES (Discounts, Special Prices, Tier Prices)
+-- =============================================
+
+IF OBJECT_ID('dbo.PriceRules', 'U') IS NOT NULL
+    DROP TABLE dbo.PriceRules;
+GO
+
+CREATE TABLE dbo.PriceRules (
+    PriceRuleId INT IDENTITY(1,1) PRIMARY KEY,
+    StoreConfigId INT NOT NULL,
+    
+    -- Source IDs
+    SourcePriceRuleId NVARCHAR(255) NULL,
+    SourcePlatform NVARCHAR(50) NULL,
+    
+    -- Basic Info
+    RuleCode NVARCHAR(100) NOT NULL,
+    Name NVARCHAR(255) NOT NULL,
+    Description NVARCHAR(500) NULL,
+    RuleType NVARCHAR(50) NOT NULL, -- 'tier_price', 'special_price', 'catalog_rule', 'cart_rule', 'discount_code'
+    
+    -- Target
+    TargetType NVARCHAR(50) DEFAULT 'line_item', -- line_item, shipping_line, cart
+    TargetSelection NVARCHAR(50) DEFAULT 'all', -- all, entitled
+    
+    -- Value
+    ValueType NVARCHAR(50) NOT NULL, -- fixed_amount, percentage, fixed_price
+    Value DECIMAL(18,4) NOT NULL,
+    AllocationMethod NVARCHAR(50) DEFAULT 'each', -- each, across
+    
+    -- Customer eligibility
+    CustomerSelection NVARCHAR(50) DEFAULT 'all', -- all, specific_groups, specific_users
+    CustomerGroups JSON NULL, -- Array of customer group IDs
+    CustomerIds JSON NULL, -- Array of user IDs
+    
+    -- Product eligibility
+    ProductSelection NVARCHAR(50) DEFAULT 'all', -- all, specific, exclude
+    ProductIds JSON NULL,
+    CategoryIds JSON NULL,
+    
+    -- Time constraints
+    StartDate DATETIME NULL,
+    EndDate DATETIME NULL,
+    
+    -- Usage limits
+    UsageLimit INT NULL,
+    UsedCount INT NOT NULL DEFAULT 0,
+    PerCustomerLimit INT NULL,
+    
+    -- Prerequisites
+    MinimumSubtotal DECIMAL(18,4) NULL,
+    MinimumQuantity INT NULL,
+    PrerequisiteConditions JSON NULL,
+    
+    -- Priority
+    Priority INT NOT NULL DEFAULT 0,
+    
+    -- Status
+    Status INT NOT NULL DEFAULT 1, -- 1: Active, 2: Inactive, 3: Expired
+    
+    -- Multi-tenant
+    OnSellerId INT NOT NULL,
+    GroupId INT NOT NULL,
+    CompanyId INT NOT NULL,
+    BranchId INT NULL,
+    
+    -- Sync tracking
+    SyncStatus NVARCHAR(50) DEFAULT 'synced',
+    CreatedAtSource DATETIME NULL,
+    UpdatedAtSource DATETIME NULL,
+    
+    -- Audit
+    CreatedBy INT NOT NULL,
+    CreatedDate DATETIME NOT NULL DEFAULT GETDATE(),
+    ModifiedBy INT NULL,
+    ModifiedDate DATETIME NULL,
+    
+    CONSTRAINT UQ_PriceRules_Store_Code UNIQUE (StoreConfigId, RuleCode),
+    CONSTRAINT FK_PriceRules_StoreConfig FOREIGN KEY (StoreConfigId) REFERENCES dbo.StoreConfigs(StoreConfigId)
+);
+GO
+
+IF OBJECT_ID('dbo.PriceRuleMappings', 'U') IS NOT NULL
+    DROP TABLE dbo.PriceRuleMappings;
+GO
+
+CREATE TABLE dbo.PriceRuleMappings (
+    PriceRuleMappingId INT IDENTITY(1,1) PRIMARY KEY,
+    PriceRuleId INT NOT NULL,
+    ProductId INT NULL,
+    ProductVariantId INT NULL,
+    ProductCategoryId INT NULL,
+    
+    CONSTRAINT FK_PriceRuleMappings_Rule FOREIGN KEY (PriceRuleId) REFERENCES dbo.PriceRules(PriceRuleId) ON DELETE CASCADE,
+    CONSTRAINT FK_PriceRuleMappings_Product FOREIGN KEY (ProductId) REFERENCES dbo.Products(ProductId) ON DELETE CASCADE,
+    CONSTRAINT FK_PriceRuleMappings_Variant FOREIGN KEY (ProductVariantId) REFERENCES dbo.ProductVariants(ProductVariantId) ON DELETE CASCADE,
+    CONSTRAINT FK_PriceRuleMappings_Category FOREIGN KEY (ProductCategoryId) REFERENCES dbo.ProductCategories(ProductCategoryId) ON DELETE CASCADE,
+    CONSTRAINT CK_PriceRuleMappings_Target CHECK (
+        ProductId IS NOT NULL OR 
+        ProductVariantId IS NOT NULL OR 
+        ProductCategoryId IS NOT NULL
+    )
+);
+GO
+
+IF OBJECT_ID('dbo.TierPrices', 'U') IS NOT NULL
+    DROP TABLE dbo.TierPrices;
+GO
+
+CREATE TABLE dbo.TierPrices (
+    TierPriceId INT IDENTITY(1,1) PRIMARY KEY,
+    ProductId INT NULL,
+    ProductVariantId INT NULL,
+    CustomerGroupId INT NULL, -- Link to your customer groups (DropdownDetails)
+    MinimumQuantity INT NOT NULL,
+    Price DECIMAL(18,4) NOT NULL,
+    CreatedDate DATETIME NOT NULL DEFAULT GETDATE(),
+    
+    CONSTRAINT FK_TierPrices_Product FOREIGN KEY (ProductId) REFERENCES dbo.Products(ProductId) ON DELETE CASCADE,
+    CONSTRAINT FK_TierPrices_Variant FOREIGN KEY (ProductVariantId) REFERENCES dbo.ProductVariants(ProductVariantId) ON DELETE CASCADE,
+    CONSTRAINT CK_TierPrices_Target CHECK (ProductId IS NOT NULL OR ProductVariantId IS NOT NULL)
+);
+GO
+
+-- =============================================
+-- 11. DISCOUNT CODES
+-- =============================================
+
+IF OBJECT_ID('dbo.DiscountCodes', 'U') IS NOT NULL
+    DROP TABLE dbo.DiscountCodes;
+GO
+
+CREATE TABLE dbo.DiscountCodes (
+    DiscountCodeId INT IDENTITY(1,1) PRIMARY KEY,
+    PriceRuleId INT NOT NULL,
+    
+    -- Source IDs
+    SourceDiscountCodeId NVARCHAR(255) NULL,
+    SourcePlatform NVARCHAR(50) NULL,
+    
+    -- Code Info
     Code NVARCHAR(255) NOT NULL,
     UsageCount INT NOT NULL DEFAULT 0,
+    UsageLimitPerCode INT NULL,
     
-    -- Sync
-    CreatedAtShopify DATETIME NULL,
-    UpdatedAtShopify DATETIME NULL,
+    -- Sync tracking
+    CreatedAtSource DATETIME NULL,
+    UpdatedAtSource DATETIME NULL,
     
     -- Audit
     CreatedDate DATETIME NOT NULL DEFAULT GETDATE(),
     
-    CONSTRAINT FK_ShopifyDiscountCodes_PriceRule FOREIGN KEY (ShopifyPriceRuleId) REFERENCES dbo.ShopifyPriceRules(ShopifyPriceRuleId) ON DELETE CASCADE,
-    CONSTRAINT UQ_ShopifyDiscountCodes_PriceRule_Code UNIQUE (ShopifyPriceRuleId, Code)
+    CONSTRAINT UQ_DiscountCodes_PriceRule_Code UNIQUE (PriceRuleId, Code),
+    CONSTRAINT FK_DiscountCodes_PriceRule FOREIGN KEY (PriceRuleId) REFERENCES dbo.PriceRules(PriceRuleId) ON DELETE CASCADE
 );
 GO
 
 -- =============================================
--- 10. SHOPIFY ORDERS (Integration with your Purchase Orders)
+-- 12. PRODUCT RELATIONSHIPS (Cross-sell, Up-sell, Related)
 -- =============================================
 
-IF OBJECT_ID('dbo.ShopifyOrders', 'U') IS NOT NULL
-    DROP TABLE dbo.ShopifyOrders;
+IF OBJECT_ID('dbo.ProductRelations', 'U') IS NOT NULL
+    DROP TABLE dbo.ProductRelations;
 GO
 
-CREATE TABLE dbo.ShopifyOrders (
-    ShopifyOrderId INT IDENTITY(1,1) PRIMARY KEY,
-    ShopifyStoreConfigId INT NOT NULL,
+CREATE TABLE dbo.ProductRelations (
+    ProductRelationId INT IDENTITY(1,1) PRIMARY KEY,
+    SourceProductId INT NOT NULL,
+    TargetProductId INT NOT NULL,
+    RelationType NVARCHAR(50) NOT NULL, -- 'related', 'cross_sell', 'up_sell', 'accessory', 'bundle'
+    SortOrder INT NOT NULL DEFAULT 0,
+    CreatedDate DATETIME NOT NULL DEFAULT GETDATE(),
     
-    -- Shopify Source
-    ShopifyOrderSourceId BIGINT NOT NULL,
-    OrderNumber NVARCHAR(50) NOT NULL,
-    Name NVARCHAR(100) NOT NULL,
+    CONSTRAINT UQ_ProductRelations_Source_Target_Type UNIQUE (SourceProductId, TargetProductId, RelationType),
+    CONSTRAINT FK_ProductRelations_SourceProduct FOREIGN KEY (SourceProductId) REFERENCES dbo.Products(ProductId),
+    CONSTRAINT FK_ProductRelations_TargetProduct FOREIGN KEY (TargetProductId) REFERENCES dbo.Products(ProductId)
+);
+GO
+
+-- =============================================
+-- 13. METAFIELDS (Custom fields for product, variant, category)
+-- =============================================
+
+IF OBJECT_ID('dbo.Metafields', 'U') IS NOT NULL
+    DROP TABLE dbo.Metafields;
+GO
+
+CREATE TABLE dbo.Metafields (
+    MetafieldId INT IDENTITY(1,1) PRIMARY KEY,
+    StoreConfigId INT NOT NULL,
     
-    -- Customer Info
-    CustomerEmail NVARCHAR(255) NULL,
-    CustomerFirstName NVARCHAR(100) NULL,
-    CustomerLastName NVARCHAR(100) NULL,
+    -- Owner Info (Polymorphic)
+    OwnerType NVARCHAR(50) NOT NULL, -- 'product', 'variant', 'category'
+    OwnerId INT NOT NULL, -- ID in respective table
     
-    -- Order Details
-    FinancialStatus NVARCHAR(50) NULL,
-    FulfillmentStatus NVARCHAR(50) NULL,
-    TotalPrice DECIMAL(18,2) NOT NULL,
-    SubtotalPrice DECIMAL(18,2) NOT NULL,
-    TotalTax DECIMAL(18,2) NOT NULL,
-    Currency NVARCHAR(3) NOT NULL,
+    -- Source IDs
+    SourceMetafieldId NVARCHAR(255) NULL,
+    SourcePlatform NVARCHAR(50) NULL,
     
-    -- Dates
-    OrderDate DATETIME NOT NULL,
-    CreatedAtShopify DATETIME NULL,
-    UpdatedAtShopify DATETIME NULL,
+    -- Metafield Data
+    Namespace NVARCHAR(255) NOT NULL,
+    KeyName NVARCHAR(255) NOT NULL, -- 'Key' is reserved, using KeyName
+    Value NVARCHAR(MAX) NOT NULL,
+    ValueType NVARCHAR(50) DEFAULT 'string', -- string, integer, decimal, boolean, json, date
     
-    -- Link to your Purchase Order (if applicable)
-    PurchaseOrderId UNIQUEIDENTIFIER NULL,
+    -- Description
+    Description NVARCHAR(500) NULL,
     
-    -- Order Data (full JSON from Shopify)
-    OrderData JSON NULL,
+    -- Visibility
+    IsVisible BIT NOT NULL DEFAULT 1,
     
-    -- Sync
-    IsProcessed BIT NOT NULL DEFAULT 0,
-    ProcessedDate DATETIME NULL,
+    -- Sync tracking
+    CreatedAtSource DATETIME NULL,
+    UpdatedAtSource DATETIME NULL,
     
     -- Audit
-    CreatedBy INT NOT NULL,
     CreatedDate DATETIME NOT NULL DEFAULT GETDATE(),
-    ModifiedBy INT NULL,
     ModifiedDate DATETIME NULL,
     
-    CONSTRAINT FK_ShopifyOrders_StoreConfig FOREIGN KEY (ShopifyStoreConfigId) REFERENCES dbo.ShopifyStoreConfigs(ShopifyStoreConfigId),
-    CONSTRAINT FK_ShopifyOrders_PurchaseOrder FOREIGN KEY (PurchaseOrderId) REFERENCES dbo.PurchaseOrders(Id)
-);
-GO
-
-IF OBJECT_ID('dbo.ShopifyOrderItems', 'U') IS NOT NULL
-    DROP TABLE dbo.ShopifyOrderItems;
-GO
-
-CREATE TABLE dbo.ShopifyOrderItems (
-    ShopifyOrderItemId INT IDENTITY(1,1) PRIMARY KEY,
-    ShopifyOrderId INT NOT NULL,
-    ShopifyVariantId INT NOT NULL,
-    
-    -- Product Info at time of order
-    ProductTitle NVARCHAR(500) NOT NULL,
-    VariantTitle NVARCHAR(500) NOT NULL,
-    Sku NVARCHAR(255) NULL,
-    
-    -- Quantity & Price
-    Quantity INT NOT NULL,
-    Price DECIMAL(18,2) NOT NULL,
-    TotalDiscount DECIMAL(18,2) NOT NULL DEFAULT 0,
-    
-    -- Link to PO Item (if applicable)
-    POItemId UNIQUEIDENTIFIER NULL,
-    
-    -- Audit
-    CreatedDate DATETIME NOT NULL DEFAULT GETDATE(),
-    
-    CONSTRAINT FK_ShopifyOrderItems_Order FOREIGN KEY (ShopifyOrderId) REFERENCES dbo.ShopifyOrders(ShopifyOrderId) ON DELETE CASCADE,
-    CONSTRAINT FK_ShopifyOrderItems_Variant FOREIGN KEY (ShopifyVariantId) REFERENCES dbo.ShopifyVariants(ShopifyVariantId),
-    CONSTRAINT FK_ShopifyOrderItems_POItem FOREIGN KEY (POItemId) REFERENCES dbo.POItems(Id)
+    CONSTRAINT UQ_Metafields_Store_Owner_Namespace_Key UNIQUE (StoreConfigId, OwnerType, OwnerId, Namespace, KeyName),
+    CONSTRAINT FK_Metafields_StoreConfig FOREIGN KEY (StoreConfigId) REFERENCES dbo.StoreConfigs(StoreConfigId)
 );
 GO
 
 -- =============================================
--- 11. SYNC LOGS (Extending your AuditTrackings pattern)
+-- 14. SYNC LOGS (Extending your AuditTrackings pattern)
 -- =============================================
 
-IF OBJECT_ID('dbo.ShopifySyncLogs', 'U') IS NOT NULL
-    DROP TABLE dbo.ShopifySyncLogs;
+IF OBJECT_ID('dbo.SyncLogs', 'U') IS NOT NULL
+    DROP TABLE dbo.SyncLogs;
 GO
 
-CREATE TABLE dbo.ShopifySyncLogs (
-    ShopifySyncLogId INT IDENTITY(1,1) PRIMARY KEY,
-    ShopifyStoreConfigId INT NOT NULL,
+CREATE TABLE dbo.SyncLogs (
+    SyncLogId INT IDENTITY(1,1) PRIMARY KEY,
+    StoreConfigId INT NOT NULL,
     
     -- Sync Info
-    EntityType NVARCHAR(50) NOT NULL, -- product, variant, collection, order, inventory
+    EntityType NVARCHAR(50) NOT NULL, -- product, variant, category, order, inventory, price_rule
     EntityId INT NULL, -- Local entity ID
-    ShopifyEntityId BIGINT NULL,
+    SourceEntityId NVARCHAR(255) NULL, -- External platform entity ID
     
-    SyncType NVARCHAR(50) NOT NULL, -- pull, push, webhook
-    Status NVARCHAR(50) NOT NULL, -- success, failed, pending, processing
+    SyncType NVARCHAR(50) NOT NULL, -- pull, push, webhook, import, export
+    Direction NVARCHAR(20) NOT NULL, -- inbound, outbound, bidirectional
+    Status NVARCHAR(50) NOT NULL, -- pending, processing, success, failed, partial
+    
+    -- Tracking
     RetryCount INT NOT NULL DEFAULT 0,
+    RetryReason NVARCHAR(500) NULL,
     
     -- Data
     RequestData JSON NULL,
     ResponseData JSON NULL,
     ErrorMessage NVARCHAR(MAX) NULL,
+    ErrorCode NVARCHAR(100) NULL,
+    
+    -- Statistics
+    RecordsProcessed INT NULL,
+    RecordsSucceeded INT NULL,
+    RecordsFailed INT NULL,
     
     -- Timing
     StartedAt DATETIME NOT NULL DEFAULT GETDATE(),
@@ -629,45 +856,61 @@ CREATE TABLE dbo.ShopifySyncLogs (
     CompanyId INT NULL,
     BranchId INT NULL,
     
-    CONSTRAINT FK_ShopifySyncLogs_StoreConfig FOREIGN KEY (ShopifyStoreConfigId) REFERENCES dbo.ShopifyStoreConfigs(ShopifyStoreConfigId)
+    -- Audit
+    CreatedBy INT NULL,
+    CreatedDate DATETIME NOT NULL DEFAULT GETDATE(),
+    
+    CONSTRAINT FK_SyncLogs_StoreConfig FOREIGN KEY (StoreConfigId) REFERENCES dbo.StoreConfigs(StoreConfigId)
 );
 GO
 
 -- =============================================
--- 12. WEBHOOK REGISTRATIONS
+-- 15. WEBHOOK REGISTRATIONS
 -- =============================================
 
-IF OBJECT_ID('dbo.ShopifyWebhooks', 'U') IS NOT NULL
-    DROP TABLE dbo.ShopifyWebhooks;
+IF OBJECT_ID('dbo.WebhookRegistrations', 'U') IS NOT NULL
+    DROP TABLE dbo.WebhookRegistrations;
 GO
 
-CREATE TABLE dbo.ShopifyWebhooks (
-    ShopifyWebhookId INT IDENTITY(1,1) PRIMARY KEY,
-    ShopifyStoreConfigId INT NOT NULL,
+CREATE TABLE dbo.WebhookRegistrations (
+    WebhookRegistrationId INT IDENTITY(1,1) PRIMARY KEY,
+    StoreConfigId INT NOT NULL,
+    
+    -- Source IDs
+    SourceWebhookId NVARCHAR(255) NULL,
+    SourcePlatform NVARCHAR(50) NULL,
     
     -- Webhook Info
     Topic NVARCHAR(255) NOT NULL,
     Address NVARCHAR(1000) NOT NULL,
     Format NVARCHAR(50) NOT NULL DEFAULT 'json',
+    ApiVersion NVARCHAR(20) NULL,
     
-    -- Shopify Source
-    ShopifyWebhookSourceId BIGINT NOT NULL,
+    -- Headers (JSON for custom headers)
+    Headers JSON NULL,
     
     -- Status
-    Status NVARCHAR(50) NOT NULL DEFAULT 'enabled',
+    Status NVARCHAR(50) NOT NULL DEFAULT 'enabled', -- enabled, disabled, failed
     
-    -- Stats
+    -- Filters (JSON for webhook filters)
+    Filters JSON NULL,
+    
+    -- Statistics
     LastSuccessAt DATETIME NULL,
     LastFailureAt DATETIME NULL,
     FailureCount INT NOT NULL DEFAULT 0,
+    SuccessCount INT NOT NULL DEFAULT 0,
+    
+    -- Sync tracking
+    CreatedAtSource DATETIME NULL,
+    UpdatedAtSource DATETIME NULL,
     
     -- Audit
-    CreatedAtShopify DATETIME NULL,
-    UpdatedAtShopify DATETIME NULL,
     CreatedDate DATETIME NOT NULL DEFAULT GETDATE(),
+    ModifiedDate DATETIME NULL,
     
-    CONSTRAINT FK_ShopifyWebhooks_StoreConfig FOREIGN KEY (ShopifyStoreConfigId) REFERENCES dbo.ShopifyStoreConfigs(ShopifyStoreConfigId),
-    CONSTRAINT UQ_ShopifyWebhooks_Store_Topic UNIQUE (ShopifyStoreConfigId, Topic)
+    CONSTRAINT UQ_WebhookRegistrations_Store_Topic UNIQUE (StoreConfigId, Topic),
+    CONSTRAINT FK_WebhookRegistrations_StoreConfig FOREIGN KEY (StoreConfigId) REFERENCES dbo.StoreConfigs(StoreConfigId)
 );
 GO
 
@@ -675,204 +918,33 @@ GO
 -- INDEXES (Matching your existing naming convention)
 -- =============================================
 
--- Shopify Products
-CREATE INDEX IX_ShopifyProducts_StoreConfig ON dbo.ShopifyProducts(ShopifyStoreConfigId);
-CREATE INDEX IX_ShopifyProducts_Handle ON dbo.ShopifyProducts(Handle);
-CREATE INDEX IX_ShopifyProducts_Status ON dbo.ShopifyProducts(Status);
-CREATE INDEX IX_ShopifyProducts_Company ON dbo.ShopifyProducts(CompanyId, OnSellerId, GroupId);
-CREATE INDEX IX_ShopifyProducts_SyncStatus ON dbo.ShopifyProducts(SyncStatus);
+-- Products
+CREATE INDEX IX_Products_StoreConfig ON dbo.Products(StoreConfigId);
+CREATE INDEX IX_Products_Sku ON dbo.Products(Sku);
+CREATE INDEX IX_Products_Handle ON dbo.Products(Handle);
+CREATE INDEX IX_Products_Status ON dbo.Products(Status);
+CREATE INDEX IX_Products_Company ON dbo.Products(CompanyId, OnSellerId, GroupId);
+CREATE INDEX IX_Products_SyncStatus ON dbo.Products(SyncStatus);
+CREATE INDEX IX_Products_ProductType ON dbo.Products(ProductTypeId);
+CREATE INDEX IX_Products_Brand ON dbo.Products(BrandId);
+CREATE INDEX IX_Products_PublishedAt ON dbo.Products(PublishedAt);
+CREATE INDEX IX_Products_Source ON dbo.Products(SourcePlatform, SourceProductId);
 
--- Shopify Variants
-CREATE INDEX IX_ShopifyVariants_Product ON dbo.ShopifyVariants(ShopifyProductId);
-CREATE INDEX IX_ShopifyVariants_Sku ON dbo.ShopifyVariants(Sku);
-CREATE INDEX IX_ShopifyVariants_Barcode ON dbo.ShopifyVariants(Barcode);
-CREATE INDEX IX_ShopifyVariants_Status ON dbo.ShopifyVariants(Status);
+-- Product Variants
+CREATE INDEX IX_ProductVariants_Product ON dbo.ProductVariants(ProductId);
+CREATE INDEX IX_ProductVariants_Sku ON dbo.ProductVariants(Sku);
+CREATE INDEX IX_ProductVariants_Barcode ON dbo.ProductVariants(Barcode);
+CREATE INDEX IX_ProductVariants_Status ON dbo.ProductVariants(Status);
+CREATE INDEX IX_ProductVariants_IsDefault ON dbo.ProductVariants(IsDefault);
+CREATE INDEX IX_ProductVariants_Source ON dbo.ProductVariants(SourcePlatform, SourceVariantId);
 
--- Shopify Collections
-CREATE INDEX IX_ShopifyCollections_StoreConfig ON dbo.ShopifyCollections(ShopifyStoreConfigId);
-CREATE INDEX IX_ShopifyCollections_Handle ON dbo.ShopifyCollections(Handle);
-CREATE INDEX IX_ShopifyCollections_Company ON dbo.ShopifyCollections(CompanyId, OnSellerId, GroupId);
+-- Product Categories
+CREATE INDEX IX_ProductCategories_StoreConfig ON dbo.ProductCategories(StoreConfigId);
+CREATE INDEX IX_ProductCategories_Handle ON dbo.ProductCategories(Handle);
+CREATE INDEX IX_ProductCategories_Parent ON dbo.ProductCategories(ParentCategoryId);
+CREATE INDEX IX_ProductCategories_Company ON dbo.ProductCategories(CompanyId, OnSellerId, GroupId);
+CREATE INDEX IX_ProductCategories_CategoryLevel ON dbo.ProductCategories(CategoryLevel);
+CREATE INDEX IX_ProductCategories_CategoryPath ON dbo.ProductCategories(CategoryPath);
 
--- Inventory Levels
-CREATE INDEX IX_ShopifyInventoryLevels_Variant ON dbo.ShopifyInventoryLevels(ShopifyVariantId);
-CREATE INDEX IX_ShopifyInventoryLevels_Location ON dbo.ShopifyInventoryLevels(ShopifyLocationId);
-CREATE INDEX IX_ShopifyInventoryLevels_Available ON dbo.ShopifyInventoryLevels(AvailableQuantity);
-
--- Shopify Orders
-CREATE INDEX IX_ShopifyOrders_StoreConfig ON dbo.ShopifyOrders(ShopifyStoreConfigId);
-CREATE INDEX IX_ShopifyOrders_OrderNumber ON dbo.ShopifyOrders(OrderNumber);
-CREATE INDEX IX_ShopifyOrders_Dates ON dbo.ShopifyOrders(OrderDate, CreatedDate);
-CREATE INDEX IX_ShopifyOrders_PurchaseOrder ON dbo.ShopifyOrders(PurchaseOrderId);
-
--- Shopify Order Items
-CREATE INDEX IX_ShopifyOrderItems_Order ON dbo.ShopifyOrderItems(ShopifyOrderId);
-CREATE INDEX IX_ShopifyOrderItems_Variant ON dbo.ShopifyOrderItems(ShopifyVariantId);
-CREATE INDEX IX_ShopifyOrderItems_POItem ON dbo.ShopifyOrderItems(POItemId);
-
--- Shopify Images
-CREATE INDEX IX_ShopifyImages_Product ON dbo.ShopifyImages(ShopifyProductId);
-CREATE INDEX IX_ShopifyImages_Variant ON dbo.ShopifyImages(ShopifyVariantId);
-CREATE INDEX IX_ShopifyImages_Position ON dbo.ShopifyImages(Position);
-
--- Shopify Metafields
-CREATE INDEX IX_ShopifyMetafields_Owner ON dbo.ShopifyMetafields(OwnerResource, OwnerId);
-CREATE INDEX IX_ShopifyMetafields_Namespace_Key ON dbo.ShopifyMetafields(Namespace, KeyName);
-CREATE INDEX IX_ShopifyMetafields_StoreConfig ON dbo.ShopifyMetafields(ShopifyStoreConfigId);
-
--- Sync Logs (matching your AuditTrackings pattern)
-CREATE INDEX IX_ShopifySyncLogs_StoreConfig ON dbo.ShopifySyncLogs(ShopifyStoreConfigId);
-CREATE INDEX IX_ShopifySyncLogs_Entity ON dbo.ShopifySyncLogs(EntityType, EntityId);
-CREATE INDEX IX_ShopifySyncLogs_Status ON dbo.ShopifySyncLogs(Status);
-CREATE INDEX IX_ShopifySyncLogs_CreatedAt ON dbo.ShopifySyncLogs(StartedAt);
-
--- JSON indexes (for SQL Server 2016+)
-CREATE INDEX IX_ShopifyProducts_Tags ON dbo.ShopifyProducts(Tags);
-CREATE INDEX IX_ShopifyProducts_Attributes ON dbo.ShopifyProducts(Attributes);
-GO
-
--- =============================================
--- HELPER VIEWS
--- =============================================
-
--- View: Product inventory summary (matching existing pattern)
-IF OBJECT_ID('dbo.vw_ShopifyProductInventory', 'V') IS NOT NULL
-    DROP VIEW dbo.vw_ShopifyProductInventory;
-GO
-
-CREATE VIEW dbo.vw_ShopifyProductInventory AS
-SELECT 
-    p.ShopifyProductId,
-    p.Title,
-    p.Handle,
-    p.Sku,
-    p.HasVariants,
-    COUNT(DISTINCT v.ShopifyVariantId) AS VariantCount,
-    SUM(COALESCE(il.AvailableQuantity, v.InventoryQuantity)) AS TotalAvailableInventory,
-    MIN(v.Price) AS MinPrice,
-    MAX(v.Price) AS MaxPrice,
-    MIN(CASE WHEN v.IsDefault = 1 THEN v.Price END) AS DefaultPrice,
-    p.Status,
-    p.CompanyId,
-    p.OnSellerId,
-    p.GroupId
-FROM dbo.ShopifyProducts p
-LEFT JOIN dbo.ShopifyVariants v ON p.ShopifyProductId = v.ShopifyProductId AND v.Status = 1
-LEFT JOIN dbo.ShopifyInventoryLevels il ON v.ShopifyVariantId = il.ShopifyVariantId
-WHERE p.Status = 1
-GROUP BY p.ShopifyProductId, p.Title, p.Handle, p.Sku, p.HasVariants, p.Status, p.CompanyId, p.OnSellerId, p.GroupId;
-GO
-
--- View: Products by Company (multi-tenant)
-IF OBJECT_ID('dbo.vw_ShopifyProductsByCompany', 'V') IS NOT NULL
-    DROP VIEW dbo.vw_ShopifyProductsByCompany;
-GO
-
-CREATE VIEW dbo.vw_ShopifyProductsByCompany AS
-SELECT 
-    p.*,
-    c.Name AS CompanyName,
-    s.StoreName,
-    s.ShopDomain
-FROM dbo.ShopifyProducts p
-INNER JOIN dbo.Companies c ON p.CompanyId = c.CompanyId
-INNER JOIN dbo.ShopifyStoreConfigs s ON p.ShopifyStoreConfigId = s.ShopifyStoreConfigId;
-GO
-
--- =============================================
--- STORED PROCEDURES
--- =============================================
-
--- SP: Sync product from Shopify
-IF OBJECT_ID('dbo.sp_Shopify_SyncProduct', 'P') IS NOT NULL
-    DROP PROCEDURE dbo.sp_Shopify_SyncProduct;
-GO
-
-CREATE PROCEDURE dbo.sp_Shopify_SyncProduct
-    @StoreConfigId INT,
-    @ShopifyProductId BIGINT,
-    @ProductData JSON,
-    @UserId INT,
-    @SyncLogId INT OUTPUT
-AS
-BEGIN
-    SET NOCOUNT ON;
-    BEGIN TRY
-        BEGIN TRANSACTION;
-        
-        -- Create sync log (matching AuditTrackings pattern)
-        INSERT INTO dbo.ShopifySyncLogs (
-            ShopifyStoreConfigId, EntityType, ShopifyEntityId, SyncType, 
-            Status, RequestData, StartedAt, CreatedBy
-        )
-        VALUES (
-            @StoreConfigId, 'product', @ShopifyProductId, 'pull',
-            'processing', @ProductData, GETDATE(), @UserId
-        );
-        
-        SET @SyncLogId = SCOPE_IDENTITY();
-        
-        -- Extract store config to get multi-tenant IDs
-        DECLARE @OnSellerId INT, @GroupId INT, @CompanyId INT, @BranchId INT;
-        
-        SELECT 
-            @OnSellerId = OnSellerId,
-            @GroupId = GroupId,
-            @CompanyId = CompanyId,
-            @BranchId = BranchId
-        FROM dbo.ShopifyStoreConfigs
-        WHERE ShopifyStoreConfigId = @StoreConfigId;
-        
-        -- Extract product data from JSON
-        DECLARE @Title NVARCHAR(500) = JSON_VALUE(@ProductData, '$.title');
-        DECLARE @Handle NVARCHAR(255) = JSON_VALUE(@ProductData, '$.handle');
-        DECLARE @BodyHtml NVARCHAR(MAX) = JSON_VALUE(@ProductData, '$.body_html');
-        DECLARE @Vendor NVARCHAR(255) = JSON_VALUE(@ProductData, '$.vendor');
-        DECLARE @ProductType NVARCHAR(255) = JSON_VALUE(@ProductData, '$.product_type');
-        DECLARE @Status NVARCHAR(50) = JSON_VALUE(@ProductData, '$.status');
-        DECLARE @PublishedAt DATETIME = JSON_VALUE(@ProductData, '$.published_at');
-        DECLARE @Tags NVARCHAR(MAX) = JSON_QUERY(@ProductData, '$.tags');
-        DECLARE @Option1Name NVARCHAR(100) = JSON_VALUE(@ProductData, '$.options[0].name');
-        DECLARE @Option2Name NVARCHAR(100) = JSON_VALUE(@ProductData, '$.options[1].name');
-        DECLARE @Option3Name NVARCHAR(100) = JSON_VALUE(@ProductData, '$.options[2].name');
-        
-        -- UPSERT product
-        MERGE dbo.ShopifyProducts AS target
-        USING (SELECT @StoreConfigId AS ShopifyStoreConfigId, @ShopifyProductId AS ShopifyProductSourceId) AS source
-        ON target.ShopifyStoreConfigId = source.ShopifyStoreConfigId 
-           AND target.ShopifyProductSourceId = source.ShopifyProductSourceId
-        WHEN MATCHED THEN
-            UPDATE SET 
-                Title = @Title,
-                Handle = @Handle,
-                BodyHtml = @BodyHtml,
-                Vendor = @Vendor,
-                ProductType = @ProductType,
-                Status = CASE WHEN @Status = 'active' THEN 1 ELSE 2 END,
-                PublishedAt = @PublishedAt,
-                Tags = @Tags,
-                Option1Name = @Option1Name,
-                Option2Name = @Option2Name,
-                Option3Name = @Option3Name,
-                UpdatedAtShopify = GETDATE(),
-                ModifiedDate = GETDATE(),
-                ModifiedBy = @UserId,
-                ExternalData = @ProductData,
-                SyncStatus = 'synced',
-                LastSyncedAt = GETDATE()
-        WHEN NOT MATCHED THEN
-            INSERT (
-                ShopifyStoreConfigId, ShopifyProductSourceId, Title, Handle, BodyHtml, 
-                Vendor, ProductType, Status, PublishedAt, Tags, Option1Name, Option2Name, 
-                Option3Name, OnSellerId, GroupId, CompanyId, BranchId, CreatedBy, 
-                CreatedDate, CreatedAtShopify, ExternalData, SyncStatus, LastSyncedAt
-            )
-            VALUES (
-                @StoreConfigId, @ShopifyProductId, @Title, @Handle, @BodyHtml,
-                @Vendor, @ProductType, CASE WHEN @Status = 'active' THEN 1 ELSE 2 END, 
-                @PublishedAt, @Tags, @Option1Name, @Option2Name, @Option3Name,
-                @OnSellerId, @GroupId, @CompanyId, @BranchId, @UserId,
-                GETDATE(), GETDATE(), @ProductData, 'synced', GETDATE()
-            );
-        
-        -- Update sync log as success
-        UPDATE dbo.S
+-- Product Category Mappings
+CREATE INDEX IX_ProductCategoryMappings_Product ON dbo.ProductCategoryMappings(Product
